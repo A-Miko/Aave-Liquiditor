@@ -4,7 +4,7 @@ import axios from 'axios';
 
 dotenv.config();
 
-// ABI mínimo necesario para consultar el Pool de Aave
+// Minimum ABI needed to query Aave Pool
 const AAVE_POOL_ABI = [
     "function getUserAccountData(address user) view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)",
     "function getReservesList() view returns (address[])",
@@ -13,7 +13,7 @@ const AAVE_POOL_ABI = [
     "function getUserConfiguration(address user) view returns (tuple(uint256 data) config)"
 ];
 
-// Interfaz para la configuración de reservas
+// Interface for reserve configuration
 interface ReserveConfig {
     ltv: number;
     liquidationThreshold: number;
@@ -60,55 +60,42 @@ export class PositionMonitor {
         this.reservesList = null;
     }
 
-    private async getAddressesFromArbiscan(): Promise<string[]> {
-        try {
-            // Solo actualizar cada 5 minutos
-            const now = Date.now();
-            if (now - this.lastUpdate < 5 * 60 * 1000 && this.addressesCache.size > 0) {
-                return Array.from(this.addressesCache);
-            }
+    private async getBorrowersFromSubgraph(): Promise<string[]> {
+        const borrowers = new Set<string>();
+        let lastId = "";
 
-            const apiKey = process.env.ARBISCAN_API_KEY;
-            if (!apiKey) {
-                console.error('❌ ARBISCAN_API_KEY no configurada');
-                return Array.from(this.addressesCache);
-            }
-
-            // Obtener las últimas 10,000 transacciones del contrato de Aave
-            const response = await axios.get(`https://api.arbiscan.io/api`, {
-                params: {
-                    module: 'account',
-                    action: 'txlist',
-                    address: process.env.AAVE_LENDING_POOL,
-                    startblock: 0,
-                    endblock: 99999999,
-                    page: 1,
-                    offset: 10000,
-                    sort: 'desc',
-                    apikey: apiKey
-                }
+        while (true) {
+            const res = await axios.post(process.env.SUBGRAPH_URL!, {
+                query: `
+                    query ($lastId: String!) {
+                        positions(
+                            first: 1000, 
+                            orderBy: id, 
+                            orderDirection: asc,
+                            where: { 
+                                id_gt: $lastId, 
+                                side: BORROWER, 
+                                principal_gt: "10000000" 
+                            }
+                        ) {
+                            id
+                            account { id }   // or user { id } depending on schema
+                        }
+                    }
+                `,
+                variables: { lastId }
             });
 
-            if (response.data.status === '1' && response.data.result) {
-                // Extraer direcciones únicas de las transacciones
-                const addresses = new Set<string>();
-                for (const tx of response.data.result) {
-                    addresses.add(tx.from.toLowerCase());
-                }
+            const positions = res.data?.data?.positions ?? [];
+            if (positions.length === 0) break;
 
-                this.addressesCache = addresses;
-                this.lastUpdate = now;
-                
-                console.log(`📊 Encontradas ${addresses.size} direcciones únicas interactuando con Aave`);
-                return Array.from(addresses);
-            }
-
-            return Array.from(this.addressesCache);
-        } catch (error) {
-            console.error('Error al obtener direcciones de Arbiscan:', error);
-            return Array.from(this.addressesCache);
+            for (const p of positions) borrowers.add(p.account.id.toLowerCase());
+            lastId = positions[positions.length - 1].id;
         }
+
+        return [...borrowers];
     }
+
 
     private async getReservesList(): Promise<string[]> {
         if (!this.reservesList) {
@@ -122,7 +109,7 @@ export class PositionMonitor {
         const { data } = await this.pool.getUserConfiguration(user);
         const config = BigInt(data.toString());
         
-        // Iterar sobre las reservas para encontrar el colateral activo
+        // Iterate over reserves to find active collateral
         for (let i = 0; i < reserves.length; i++) {
             const isUsedAsCollateral = Boolean((config >> BigInt(i * 2)) & 1n);
             if (isUsedAsCollateral) {
@@ -153,7 +140,7 @@ export class PositionMonitor {
 
     async findLiquidatablePositions(): Promise<Position[]> {
         try {
-            const addresses = await this.getAddressesFromArbiscan();
+            const addresses = await this.getBorrowersFromSubgraph();
             const positions: Position[] = [];
 
             console.log(`🔍 Analizando ${addresses.length} direcciones...`);
@@ -174,21 +161,21 @@ export class PositionMonitor {
                     const totalCollateralETH = parseFloat(ethers.formatUnits(totalCollateralBase, 18));
                     const totalDebtETH = parseFloat(ethers.formatUnits(totalDebtBase, 18));
 
-                    // Obtener el activo usado como colateral
+                    // Get the asset used as collateral
                     const collateralAsset = await this.getUserCollateral(user);
                     if (!collateralAsset) continue;
 
-                    // Obtener configuración de la reserva
+                    // Get reserve configuration
                     const reserveConfig = await this.getReserveConfig(collateralAsset);
                     const liquidationBonus = reserveConfig.liquidationBonus / 100; // Convertir de porcentaje a decimal
 
-                    // Calcular beneficio potencial
-                    const maxLiquidation = totalDebtETH * 0.5; // Máximo 50% de la deuda
+                    // Calculate potential profit
+                    const maxLiquidation = totalDebtETH * 0.5; // Maximum 50% of debt
                     const estimatedProfit = (maxLiquidation * liquidationBonus) - 
-                        (maxLiquidation * 0.001); // 0.1% fee por flash loan
+                        (maxLiquidation * 0.001); // 0.1% fee for flash loan
 
-                    // Convertir a USD usando el precio de ETH (aproximado)
-                    const ethPriceUSD = 2200; // TODO: Obtener precio real
+                    // Convert to USD using ETH price (approximate)
+                    const ethPriceUSD = 2200;
                     const estimatedProfitUSD = estimatedProfit * ethPriceUSD;
 
                     if (estimatedProfitUSD < this.minProfitUSD) continue;
@@ -200,15 +187,15 @@ export class PositionMonitor {
                         totalDebtETH,
                         estimatedProfit: estimatedProfitUSD,
                         collateralAsset,
-                        liquidationBonus: liquidationBonus * 100 // Convertir a porcentaje para mostrar
+                        liquidationBonus: liquidationBonus * 100 // Convert to percentage for display
                     });
 
                     checked++;
                     if (checked % 100 === 0) {
-                        console.log(`✓ Analizadas ${checked}/${addresses.length} direcciones`);
+                        console.log(`✓ Analyzed ${checked}/${addresses.length} addresses`);
                     }
                 } catch (error) {
-                    // Ignorar errores individuales y continuar con la siguiente dirección
+                    // Ignore individual errors and continue with the next address
                     continue;
                 }
             }
@@ -227,22 +214,22 @@ export class PositionMonitor {
             const positions = await this.findLiquidatablePositions();
             
             if (positions.length > 0) {
-                console.log(`\n✅ Encontradas ${positions.length} posiciones liquidables:`);
+                console.log(`\n✅ Found ${positions.length} liquidatable positions:`);
                 positions.forEach(pos => {
                     console.log(`
-                        👤 Usuario: ${pos.user}
+                        👤 User: ${pos.user}
                         ❤️ Health Factor: ${pos.healthFactor}
-                        💰 Beneficio estimado: $${pos.estimatedProfit.toFixed(2)}
-                        🏦 Colateral Total: ${pos.totalCollateralETH.toFixed(4)} ETH
-                        💸 Deuda Total: ${pos.totalDebtETH.toFixed(4)} ETH
+                        💰 Estimated profit: $${pos.estimatedProfit.toFixed(2)}
+                        🏦 Total collateral: ${pos.totalCollateralETH.toFixed(4)} ETH
+                        💸 Total debt: ${pos.totalDebtETH.toFixed(4)} ETH
                     `);
                 });
             } else {
-                console.log('\n❌ No se encontraron posiciones liquidables');
+                console.log('\n❌ No liquidatable positions found');
             }
         };
 
-        // Primera ejecución inmediata
+        // First execution immediately
         await checkPositions();
 
         // Configurar el intervalo
