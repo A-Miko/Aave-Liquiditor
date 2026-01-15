@@ -37,10 +37,17 @@ interface Position {
     liquidationBonus?: number;
 }
 
+type SubgraphPosition = {
+  id: string;
+  account: { id: string };
+  principal: string;
+}
+
 export class PositionMonitor {
     private provider: ethers.JsonRpcProvider;
     private pool: ethers.Contract;
     private minHealthFactor: number;
+    private minHealthFactorThreshold: number;
     private minProfitUSD: number;
     private addressesCache: Set<string>;
     private lastUpdate: number;
@@ -54,6 +61,7 @@ export class PositionMonitor {
             this.provider
         );
         this.minHealthFactor = parseFloat(process.env.MIN_HEALTH_FACTOR || '1.1');
+        this.minHealthFactorThreshold = parseFloat(process.env.MIN_HEALTH_FACTOR_THRESHOLD || '1.05');
         this.minProfitUSD = parseFloat(process.env.MIN_PROFIT_USD || '100');
         this.addressesCache = new Set<string>();
         this.lastUpdate = 0;
@@ -65,37 +73,47 @@ export class PositionMonitor {
         let lastId = "";
 
         while (true) {
-            const res = await axios.post(process.env.SUBGRAPH_URL!, {
-                query: `
-                    query ($lastId: String!) {
-                        positions(
-                            first: 1000, 
-                            orderBy: id, 
-                            orderDirection: asc,
-                            where: { 
-                                id_gt: $lastId, 
-                                side: BORROWER, 
-                                principal_gt: "10000000" 
+            const res = await axios.post(
+                process.env.SUBGRAPH_URL!, 
+                {
+                    query: `
+                        query ($lastId: String!) {
+                            positions(
+                                first: 1000, 
+                                orderBy: id, 
+                                orderDirection: asc,
+                                where: { 
+                                    id_gt: $lastId, 
+                                    side: BORROWER, 
+                                    principal_gt: "10000000" 
+                                }
+                            ) {
+                                id
+                                account { id }
+                                principal
                             }
-                        ) {
-                            id
-                            account { id }   // or user { id } depending on schema
                         }
-                    }
-                `,
-                variables: { lastId }
-            });
+                    `,
+                    variables: { lastId }
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.SUBGRAPH_API_KEY}`,
+                        "Content-Type": "application/json",
+                    },
+                }
+            );
 
             const positions = res.data?.data?.positions ?? [];
             if (positions.length === 0) break;
 
             for (const p of positions) borrowers.add(p.account.id.toLowerCase());
-            lastId = positions[positions.length - 1].id;
+            lastId = positions[positions.length - 1].id;;
         }
+        console.log(`Found ${borrowers.size} borrowers`);
 
         return [...borrowers];
     }
-
 
     private async getReservesList(): Promise<string[]> {
         if (!this.reservesList) {
@@ -143,7 +161,7 @@ export class PositionMonitor {
             const addresses = await this.getBorrowersFromSubgraph();
             const positions: Position[] = [];
 
-            console.log(`🔍 Analizando ${addresses.length} direcciones...`);
+            console.log(`🔍 Analyzing ${addresses.length} addresses...`);
             let checked = 0;
 
             for (const user of addresses) {
@@ -202,13 +220,13 @@ export class PositionMonitor {
 
             return positions.sort((a, b) => b.estimatedProfit - a.estimatedProfit);
         } catch (error) {
-            console.error('Error al buscar posiciones:', error);
+            console.error('Error searching positions:', error);
             return [];
         }
     }
 
     async startMonitoring(interval: number = 60000) {
-        console.log('🚀 Iniciando monitoreo de posiciones...');
+        console.log('🚀 Starting position monitoring...');
         
         const checkPositions = async () => {
             const positions = await this.findLiquidatablePositions();
