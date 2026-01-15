@@ -43,6 +43,15 @@ type SubgraphPosition = {
   principal: string;
 }
 
+const ADDRESSES_PROVIDER_ABI = [
+  "function getPriceOracle() external view returns (address)"
+];
+
+const AAVE_ORACLE_ABI = [
+  "function getAssetPrice(address asset) external view returns (uint256)",
+  "function BASE_CURRENCY_UNIT() external view returns (uint256)"
+];
+
 export class PositionMonitor {
     private provider: ethers.JsonRpcProvider;
     private pool: ethers.Contract;
@@ -52,6 +61,7 @@ export class PositionMonitor {
     private addressesCache: Set<string>;
     private lastUpdate: number;
     private reservesList: string[] | null;
+    private oracle: ethers.Contract | null = null;
 
     constructor() {
         this.provider = new ethers.JsonRpcProvider(process.env.ARBITRUM_RPC_URL);
@@ -66,6 +76,40 @@ export class PositionMonitor {
         this.addressesCache = new Set<string>();
         this.lastUpdate = 0;
         this.reservesList = null;
+    }
+
+    private async getAaveOracle(): Promise<ethers.Contract> {
+        if (this.oracle) return this.oracle;
+
+        // Option A: Use env var directly (fastest)
+        if (process.env.AAVE_ORACLE) {
+            this.oracle = new ethers.Contract(process.env.AAVE_ORACLE, AAVE_ORACLE_ABI, this.provider);
+            return this.oracle;
+        }
+
+        // Option B: Discover oracle from PoolAddressesProvider
+        const providerAddr = process.env.AAVE_ADDRESSES_PROVIDER;
+        if (!providerAddr) throw new Error("Missing AAVE_ADDRESSES_PROVIDER (or set AAVE_ORACLE).");
+
+        const addressesProvider = new ethers.Contract(providerAddr, ADDRESSES_PROVIDER_ABI, this.provider);
+        const oracleAddr: string = await addressesProvider.getPriceOracle(); // returns PriceOracle address [web:268]
+        this.oracle = new ethers.Contract(oracleAddr, AAVE_ORACLE_ABI, this.provider);
+
+        return this.oracle;
+    }
+
+    private async getAssetPriceUSD(asset: string): Promise<number> {
+        const oracle = await this.getAaveOracle();
+
+        // Oracle returns price in BASE_CURRENCY in wei; BASE_CURRENCY_UNIT tells the scaling. [web:470][web:265]
+        const [price, unit]: [bigint, bigint] = await Promise.all([
+            oracle.getAssetPrice(asset),
+            oracle.BASE_CURRENCY_UNIT()
+        ]);
+
+        // Convert to a floating USD-ish number (base currency is usually USD in Aave v3 markets).
+        // Keep it simple here; for production, avoid float and keep BigInt/decimal math.
+        return Number(price) / Number(unit);
     }
 
     private async getBorrowersFromSubgraph(): Promise<string[]> {
@@ -174,7 +218,27 @@ export class PositionMonitor {
 
                     const healthFactorNumber = parseFloat(ethers.formatUnits(healthFactor, 18));
                     
-                    if (healthFactorNumber >= this.minHealthFactor) continue;
+                    // 1) Store "near liquidation" range: [MIN_HEALTH_FACTOR, MIN_HEALTH_FACTOR_THRESHOLD)
+                    if (
+                        healthFactorNumber >= this.minHealthFactor &&
+                        healthFactorNumber < this.minHealthFactorThreshold
+                    ) {
+                        // TODO: persist to DB (placeholder)
+                        // await this.storeWatchlistCandidate({
+                        //   user,
+                        //   healthFactor: healthFactorNumber,
+                        //   observedAt: new Date(),
+                        // });
+                        console.log(`📌 Near-liquidation: ${user} HF=${healthFactorNumber.toFixed(4)} (between ${this.minHealthFactor} and ${this.minHealthFactorThreshold})`);
+
+                        // You probably don't want to run full profitability checks for these yet
+                        continue;
+                    }
+
+                    // 2) Skip healthy positions (>= threshold)
+                    if (healthFactorNumber >= this.minHealthFactorThreshold) continue;
+
+                    // 3) Below MIN_HEALTH_FACTOR -> proceed with liquidatable/profit checks
 
                     const totalCollateralETH = parseFloat(ethers.formatUnits(totalCollateralBase, 18));
                     const totalDebtETH = parseFloat(ethers.formatUnits(totalDebtBase, 18));
@@ -193,8 +257,8 @@ export class PositionMonitor {
                         (maxLiquidation * 0.001); // 0.1% fee for flash loan
 
                     // Convert to USD using ETH price (approximate)
-                    const ethPriceUSD = 2200;
-                    const estimatedProfitUSD = estimatedProfit * ethPriceUSD;
+                    const collateralPriceUSD = await this.getAssetPriceUSD(collateralAsset);
+                    const estimatedProfitUSD = estimatedProfit * collateralPriceUSD;
 
                     if (estimatedProfitUSD < this.minProfitUSD) continue;
 
