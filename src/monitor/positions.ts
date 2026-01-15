@@ -62,6 +62,7 @@ export class PositionMonitor {
     private lastUpdate: number;
     private reservesList: string[] | null;
     private oracle: ethers.Contract | null = null;
+    private highFrequencyHealthFactorCheck: number;
 
     constructor() {
         this.provider = new ethers.JsonRpcProvider(process.env.ARBITRUM_RPC_URL);
@@ -70,12 +71,23 @@ export class PositionMonitor {
             AAVE_POOL_ABI,
             this.provider
         );
-        this.minHealthFactor = parseFloat(process.env.MIN_HEALTH_FACTOR || '1.1');
+        this.minHealthFactor = parseFloat(process.env.MIN_HEALTH_FACTOR || '1');
         this.minHealthFactorThreshold = parseFloat(process.env.MIN_HEALTH_FACTOR_THRESHOLD || '1.05');
         this.minProfitUSD = parseFloat(process.env.MIN_PROFIT_USD || '100');
         this.addressesCache = new Set<string>();
         this.lastUpdate = 0;
         this.reservesList = null;
+        this.highFrequencyHealthFactorCheck = parseFloat(
+            process.env.HIGH_FREQUENCY_HEALTH_FACTOR_CHECK || '1.01'
+        );
+    }
+
+    private async saveNormalWatchlistPlaceholder(args: { user: string; healthFactor: number }) {
+        console.log(`📝 [normal-watchlist] user=${args.user} hf=${args.healthFactor}`);
+    }
+
+    private async saveHighFreqWatchlistPlaceholder(args: { user: string; healthFactor: number }) {
+        console.log(`⚡ [highfreq-watchlist] user=${args.user} hf=${args.healthFactor}`);
     }
 
     private async getAaveOracle(): Promise<ethers.Contract> {
@@ -216,47 +228,39 @@ export class PositionMonitor {
                         healthFactor
                     } = await this.pool.getUserAccountData(user);
 
-                    const healthFactorNumber = parseFloat(ethers.formatUnits(healthFactor, 18));
-                    
-                    // 1) Store "near liquidation" range: [MIN_HEALTH_FACTOR, MIN_HEALTH_FACTOR_THRESHOLD)
-                    if (
-                        healthFactorNumber >= this.minHealthFactor &&
-                        healthFactorNumber < this.minHealthFactorThreshold
-                    ) {
-                        // TODO: persist to DB (placeholder)
-                        // await this.storeWatchlistCandidate({
-                        //   user,
-                        //   healthFactor: healthFactorNumber,
-                        //   observedAt: new Date(),
-                        // });
-                        console.log(`📌 Near-liquidation: ${user} HF=${healthFactorNumber.toFixed(4)} (between ${this.minHealthFactor} and ${this.minHealthFactorThreshold})`);
+                    const hf = parseFloat(ethers.formatUnits(healthFactor, 18));
 
-                        // You probably don't want to run full profitability checks for these yet
+                    // 1) Above threshold: > 1.05
+                    if (hf >= this.minHealthFactorThreshold) { 
+                        // ignore
+                        continue;
+                    } 
+                    // 2) Between 1.05 and 1.01
+                    else if (hf <= this.minHealthFactorThreshold && hf >= this.highFrequencyHealthFactorCheck) {
+                        // normal watchlist: [HIGH_FREQUENCY, MIN_HEALTH_FACTOR_THRESHOLD) 
+                        await this.saveNormalWatchlistPlaceholder({ user, healthFactor: hf });
+                        continue;
+                    } 
+                    // 3) Between 1.01 and 1.00
+                    else if (hf <= this.highFrequencyHealthFactorCheck && hf >= this.minHealthFactor) {
+                        // 1.005 - high-frequency: [MIN_HEALTH_FACTOR, HIGH_FREQUENCY)
+                        await this.saveHighFreqWatchlistPlaceholder({ user, healthFactor: hf });
                         continue;
                     }
 
-                    // 2) Skip healthy positions (>= threshold)
-                    if (healthFactorNumber >= this.minHealthFactorThreshold) continue;
-
-                    // 3) Below MIN_HEALTH_FACTOR -> proceed with liquidatable/profit checks
-
+                    // 4) Liquidatable candidates: hf < MIN_HEALTH_FACTOR -> do profitability checks
                     const totalCollateralETH = parseFloat(ethers.formatUnits(totalCollateralBase, 18));
                     const totalDebtETH = parseFloat(ethers.formatUnits(totalDebtBase, 18));
 
-                    // Get the asset used as collateral
                     const collateralAsset = await this.getUserCollateral(user);
                     if (!collateralAsset) continue;
 
-                    // Get reserve configuration
                     const reserveConfig = await this.getReserveConfig(collateralAsset);
-                    const liquidationBonus = reserveConfig.liquidationBonus / 100; // Convertir de porcentaje a decimal
+                    const liquidationBonus = reserveConfig.liquidationBonus / 100;
 
-                    // Calculate potential profit
-                    const maxLiquidation = totalDebtETH * 0.5; // Maximum 50% of debt
-                    const estimatedProfit = (maxLiquidation * liquidationBonus) - 
-                        (maxLiquidation * 0.001); // 0.1% fee for flash loan
+                    const maxLiquidation = totalDebtETH * 0.5;
+                    const estimatedProfit = (maxLiquidation * liquidationBonus) - (maxLiquidation * 0.001);
 
-                    // Convert to USD using ETH price (approximate)
                     const collateralPriceUSD = await this.getAssetPriceUSD(collateralAsset);
                     const estimatedProfitUSD = estimatedProfit * collateralPriceUSD;
 
@@ -264,20 +268,19 @@ export class PositionMonitor {
 
                     positions.push({
                         user,
-                        healthFactor: healthFactorNumber,
+                        healthFactor: hf,
                         totalCollateralETH,
                         totalDebtETH,
                         estimatedProfit: estimatedProfitUSD,
                         collateralAsset,
-                        liquidationBonus: liquidationBonus * 100 // Convert to percentage for display
+                        liquidationBonus: liquidationBonus * 100
                     });
 
                     checked++;
                     if (checked % 100 === 0) {
                         console.log(`✓ Analyzed ${checked}/${addresses.length} addresses`);
                     }
-                } catch (error) {
-                    // Ignore individual errors and continue with the next address
+                } catch {
                     continue;
                 }
             }
