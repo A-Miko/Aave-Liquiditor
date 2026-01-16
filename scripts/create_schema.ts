@@ -193,6 +193,25 @@ const statements: string[] = [
   CREATE INDEX IF NOT EXISTS subgraph_positions_borrowers_borrower_idx
     ON subgraph_positions_borrowers (chain_id, borrower);
   `,
+
+  `
+  CREATE TABLE IF NOT EXISTS liquidation_opportunities (
+    id bigserial PRIMARY KEY,
+    borrower_id bigint NOT NULL REFERENCES borrowers(id) ON DELETE CASCADE,
+    observed_at timestamptz NOT NULL DEFAULT now(),
+    health_factor numeric(38,18) NOT NULL,
+    collateral_asset_address citext,
+    total_collateral_base numeric(38,18),
+    total_debt_base numeric(38,18),
+    estimated_profit_usd numeric(38,18),
+    notes text
+  );
+  `,
+
+  `
+  CREATE INDEX IF NOT EXISTS liquidation_opportunities_borrower_time_idx
+    ON liquidation_opportunities (borrower_id, observed_at DESC);
+  `,
 ];
 
 async function main() {
