@@ -2,6 +2,7 @@ import { ethers } from 'ethers';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
 import { RpcProvider } from "./RpcProvider";
+import { Pool } from 'pg';
 
 dotenv.config();
 
@@ -67,6 +68,8 @@ const AAVE_ORACLE_ABI = [
   "function BASE_CURRENCY_UNIT() external view returns (uint256)"
 ];
 
+const DATABASE_URL = `postgres://${process.env.DB_USER}:${process.env.DB_PASSWORD}@${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`;
+
 export class PositionMonitor {
     private provider: ethers.AbstractProvider;
     private pool: ethers.Contract;
@@ -79,6 +82,7 @@ export class PositionMonitor {
     private oracle: ethers.Contract | null = null;
     private highFrequencyHealthFactorCheck: number;
     private multicall: ethers.Contract;
+    private db: Pool;
 
     constructor() {
         const rpcProvider = new RpcProvider();
@@ -98,14 +102,91 @@ export class PositionMonitor {
             process.env.HIGH_FREQUENCY_HEALTH_FACTOR_CHECK || '1.01'
         );
         this.multicall = new ethers.Contract(MULTICALL3_ADDR, MULTICALL3_ABI, this.provider);
+        this.db = new Pool({ connectionString: DATABASE_URL });
     }
 
     private async saveNormalWatchlistPlaceholder(args: { user: string; healthFactor: number }) {
         console.log(`📝 [normal-watchlist] user=${args.user} hf=${args.healthFactor}`);
+
+        const chainId = parseInt(process.env.CHAIN_ID ?? "42161", 10);
+        const user = args.user.toLowerCase();
+
+        const normalPriority = parseInt(process.env.NORMAL_WATCHLIST_PRIORITY ?? "5", 10);
+        const nextCheckSeconds = parseInt(process.env.NORMAL_NEXT_CHECK_SECONDS ?? "300", 10); // 5 min
+
+        // 1) Upsert borrower and get borrower_id
+        const borrowerRes = await this.db.query<{ id: string }>(
+            `
+            INSERT INTO borrowers (chain_id, user_address, first_seen_at, last_seen_at, active)
+            VALUES ($1, $2, now(), now(), true)
+            ON CONFLICT (chain_id, user_address)
+            DO UPDATE SET last_seen_at = now(), active = true
+            RETURNING id
+            `,
+            [chainId, user]
+        );
+
+        const borrowerId = borrowerRes.rows[0].id;
+
+        // 2) Upsert monitor state
+        await this.db.query(
+            `
+            INSERT INTO borrower_monitor_state
+            (borrower_id, priority, next_check_at, last_check_at, last_health_factor, last_status, last_error)
+            VALUES
+            ($1, $2, now() + ($3::text || ' seconds')::interval, now(), $4, $5, NULL)
+            ON CONFLICT (borrower_id)
+            DO UPDATE SET
+            priority = EXCLUDED.priority,
+            next_check_at = EXCLUDED.next_check_at,
+            last_check_at = EXCLUDED.last_check_at,
+            last_health_factor = EXCLUDED.last_health_factor,
+            last_status = EXCLUDED.last_status,
+            last_error = NULL
+            `,
+            [borrowerId, normalPriority, nextCheckSeconds, args.healthFactor, "normal-watchlist"]
+        );
     }
 
     private async saveHighFreqWatchlistPlaceholder(args: { user: string; healthFactor: number }) {
-        console.log(`⚡ [highfreq-watchlist] user=${args.user} hf=${args.healthFactor}`);
+        const chainId = parseInt(process.env.CHAIN_ID ?? "42161", 10);
+        const user = args.user.toLowerCase();
+
+        const highPriority = parseInt(process.env.HIGHFREQ_WATCHLIST_PRIORITY ?? "10", 10);
+        const nextCheckSeconds = parseInt(process.env.HIGHFREQ_NEXT_CHECK_SECONDS ?? "30", 10); // 30 sec
+
+        const borrowerRes = await this.db.query<{ id: string }>(
+            `
+            INSERT INTO borrowers (chain_id, user_address, first_seen_at, last_seen_at, active)
+            VALUES ($1, $2, now(), now(), true)
+            ON CONFLICT (chain_id, user_address)
+            DO UPDATE SET last_seen_at = now(), active = true
+            RETURNING id
+            `,
+            [chainId, user]
+        );
+
+        const borrowerId = borrowerRes.rows[0].id;
+
+        await this.db.query(
+            `
+            INSERT INTO borrower_monitor_state
+            (borrower_id, priority, next_check_at, last_check_at, last_health_factor, last_status, last_error)
+            VALUES
+            ($1, $2, now() + ($3::text || ' seconds')::interval, now(), $4, $5, NULL)
+            ON CONFLICT (borrower_id)
+            DO UPDATE SET
+            priority = EXCLUDED.priority,
+            next_check_at = EXCLUDED.next_check_at,
+            last_check_at = EXCLUDED.last_check_at,
+            last_health_factor = EXCLUDED.last_health_factor,
+            last_status = EXCLUDED.last_status,
+            last_error = NULL
+            `,
+            [borrowerId, highPriority, nextCheckSeconds, args.healthFactor, "highfreq-watchlist"]
+        );
+
+        console.log(`⚡ [highfreq-watchlist] user=${user} hf=${args.healthFactor}`);
     }
 
     private async getAaveOracle(): Promise<ethers.Contract> {
