@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
+import { RpcProvider } from "./RpcProvider";
 
 dotenv.config();
 
@@ -43,6 +44,20 @@ type SubgraphPosition = {
   principal: string;
 }
 
+type UserAccountData = {
+  totalCollateralBase: bigint;
+  totalDebtBase: bigint;
+  availableBorrowsBase: bigint;
+  currentLiquidationThreshold: bigint;
+  ltv: bigint;
+  healthFactor: bigint;
+};
+
+const MULTICALL3_ADDR = process.env.MULTICALL3_ADDR || "0xca11bde05977b3631167028862be2a173976ca11";
+const MULTICALL3_ABI = [
+  "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) external view returns (tuple(bool success, bytes returnData)[] returnData)"
+];
+
 const ADDRESSES_PROVIDER_ABI = [
   "function getPriceOracle() external view returns (address)"
 ];
@@ -53,7 +68,7 @@ const AAVE_ORACLE_ABI = [
 ];
 
 export class PositionMonitor {
-    private provider: ethers.JsonRpcProvider;
+    private provider: ethers.AbstractProvider;
     private pool: ethers.Contract;
     private minHealthFactor: number;
     private minHealthFactorThreshold: number;
@@ -63,9 +78,11 @@ export class PositionMonitor {
     private reservesList: string[] | null;
     private oracle: ethers.Contract | null = null;
     private highFrequencyHealthFactorCheck: number;
+    private multicall: ethers.Contract;
 
     constructor() {
-        this.provider = new ethers.JsonRpcProvider(process.env.ARBITRUM_RPC_URL);
+        const rpcProvider = new RpcProvider();
+        this.provider = rpcProvider.getProvider();
         this.pool = new ethers.Contract(
             process.env.AAVE_LENDING_POOL || '',
             AAVE_POOL_ABI,
@@ -80,6 +97,7 @@ export class PositionMonitor {
         this.highFrequencyHealthFactorCheck = parseFloat(
             process.env.HIGH_FREQUENCY_HEALTH_FACTOR_CHECK || '1.01'
         );
+        this.multicall = new ethers.Contract(MULTICALL3_ADDR, MULTICALL3_ABI, this.provider);
     }
 
     private async saveNormalWatchlistPlaceholder(args: { user: string; healthFactor: number }) {
@@ -164,7 +182,7 @@ export class PositionMonitor {
             if (positions.length === 0) break;
 
             for (const p of positions) borrowers.add(p.account.id.toLowerCase());
-            lastId = positions[positions.length - 1].id;;
+            lastId = positions[positions.length - 1].id;
         }
         console.log(`Found ${borrowers.size} borrowers`);
 
@@ -212,6 +230,33 @@ export class PositionMonitor {
         };
     }
 
+    private async getUserAccountDataBatch(users: string[]): Promise<(UserAccountData | null)[]> {
+        const iface = this.pool.interface;
+
+        const calls = users.map((u) => ({
+            target: this.pool.target as string,
+            allowFailure: true,
+            callData: iface.encodeFunctionData("getUserAccountData", [u]),
+        }));
+
+        const results: Array<{ success: boolean; returnData: string }> =
+            await this.multicall.aggregate3(calls);
+
+        return results.map((r) => {
+            if (!r.success) return null;
+
+            const decoded = iface.decodeFunctionResult("getUserAccountData", r.returnData);
+            return {
+                totalCollateralBase: decoded[0] as bigint,
+                totalDebtBase: decoded[1] as bigint,
+                availableBorrowsBase: decoded[2] as bigint,
+                currentLiquidationThreshold: decoded[3] as bigint,
+                ltv: decoded[4] as bigint,
+                healthFactor: decoded[5] as bigint,
+            };
+        });
+    }
+
     async findLiquidatablePositions(): Promise<Position[]> {
         try {
             const addresses = await this.getBorrowersFromSubgraph();
@@ -219,16 +264,18 @@ export class PositionMonitor {
 
             console.log(`🔍 Analyzing ${addresses.length} addresses...`);
             let checked = 0;
+            const batchSize = parseInt(process.env.MULTICALL3_BATCH_SIZE || '100');
 
-            for (const user of addresses) {
-                try {
-                    const {
-                        totalCollateralBase,
-                        totalDebtBase,
-                        healthFactor
-                    } = await this.pool.getUserAccountData(user);
+            for (let i = 0; i < addresses.length; i += batchSize) {
+                const batchUsers = addresses.slice(i, i + batchSize);
+                const batchData = await this.getUserAccountDataBatch(batchUsers);
 
-                    const hf = parseFloat(ethers.formatUnits(healthFactor, 18));
+                for (let j = 0; j < batchUsers.length; j++) {
+                    const user = batchUsers[j];
+                    const accountData = batchData[j];
+                    if (!accountData) continue;
+
+                    const hf = parseFloat(ethers.formatUnits(accountData.healthFactor, 18));
 
                     // 1) Above threshold: > 1.05
                     if (hf >= this.minHealthFactorThreshold) { 
@@ -249,8 +296,8 @@ export class PositionMonitor {
                     }
 
                     // 4) Liquidatable candidates: hf < MIN_HEALTH_FACTOR -> do profitability checks
-                    const totalCollateralETH = parseFloat(ethers.formatUnits(totalCollateralBase, 18));
-                    const totalDebtETH = parseFloat(ethers.formatUnits(totalDebtBase, 18));
+                    const totalCollateralETH = parseFloat(ethers.formatUnits(accountData.totalCollateralBase, 18));
+                    const totalDebtETH = parseFloat(ethers.formatUnits(accountData.totalDebtBase, 18));
 
                     const collateralAsset = await this.getUserCollateral(user);
                     if (!collateralAsset) continue;
@@ -280,8 +327,6 @@ export class PositionMonitor {
                     if (checked % 100 === 0) {
                         console.log(`✓ Analyzed ${checked}/${addresses.length} addresses`);
                     }
-                } catch {
-                    continue;
                 }
             }
 
@@ -294,23 +339,30 @@ export class PositionMonitor {
 
     async startMonitoring(interval: number = 60000) {
         console.log('🚀 Starting position monitoring...');
+        let running = false;
         
         const checkPositions = async () => {
-            const positions = await this.findLiquidatablePositions();
+            if (running) return;
+            running = true;
             
-            if (positions.length > 0) {
-                console.log(`\n✅ Found ${positions.length} liquidatable positions:`);
-                positions.forEach(pos => {
-                    console.log(`
-                        👤 User: ${pos.user}
-                        ❤️ Health Factor: ${pos.healthFactor}
-                        💰 Estimated profit: $${pos.estimatedProfit.toFixed(2)}
-                        🏦 Total collateral: ${pos.totalCollateralETH.toFixed(4)} ETH
-                        💸 Total debt: ${pos.totalDebtETH.toFixed(4)} ETH
-                    `);
-                });
-            } else {
-                console.log('\n❌ No liquidatable positions found');
+            try {
+                const positions = await this.findLiquidatablePositions();
+                if (positions.length > 0) {
+                    console.log(`\n✅ Found ${positions.length} liquidatable positions:`);
+                    positions.forEach(pos => {
+                        console.log(`
+                            👤 User: ${pos.user}
+                            ❤️ Health Factor: ${pos.healthFactor}
+                            💰 Estimated profit: $${pos.estimatedProfit.toFixed(2)}
+                            🏦 Total collateral: ${pos.totalCollateralETH.toFixed(4)} ETH
+                            💸 Total debt: ${pos.totalDebtETH.toFixed(4)} ETH
+                        `);
+                    });
+                } else {
+                    console.log('\n❌ No liquidatable positions found');
+                }
+            } finally {
+                running = false;
             }
         };
 
