@@ -2,26 +2,26 @@ import { ethers } from 'ethers';
 import { PositionMonitor } from './monitor/positions';
 import * as dotenv from 'dotenv';
 
-// Cargar variables de entorno
+// Load environment variables
 dotenv.config();
 
 async function main() {
     try {
-        // Configurar provider y wallet
+        // Setup provider and wallet
         const provider = new ethers.JsonRpcProvider(process.env.ARBITRUM_RPC_URL);
         const wallet = new ethers.Wallet(process.env.PRIVATE_KEY || '', provider);
 
-        console.log('🚀 Iniciando bot liquidador de Aave');
-        console.log('Dirección del bot:', wallet.address);
+        console.log('🚀 Starting Aave liquidation bot');
+        console.log('Bot address:', wallet.address);
 
-        // Iniciar monitor de posiciones
+        // Start position monitor
         const monitor = new PositionMonitor();
         
-        // Iniciar monitoreo cada 1 minuto
-        await monitor.startMonitoring(60000);
+        // Start monitoring every 10 minutes
+        await monitor.startMonitoring(600000);
 
     } catch (error) {
-        console.error('Error en el bot:', error);
+        console.error('Bot error:', error);
         process.exit(1);
     }
 }
