@@ -15,7 +15,7 @@ async function main() {
         positions.forEach(pos => {
             console.log(`
             👤 User: ${pos.user}
-            ❤️ Health Factor: ${pos.healthFactor.toFixed(4)}
+            ❤️ Health Factor: ${pos.healthFactor}
             💰 Estimated profit: $${pos.estimatedProfit.toFixed(2)}
             🏦 Total collateral: ${pos.totalCollateralETH.toFixed(4)} ETH
             💸 Total debt: ${pos.totalDebtETH.toFixed(4)} ETH

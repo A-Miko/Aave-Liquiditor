@@ -1,8 +1,9 @@
 import { ethers } from 'ethers';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
-import { RpcProvider } from "./RpcProvider";
 import { Pool } from 'pg';
+import { RpcProvider } from "./RpcProvider";
+import { evaluateProfit } from "../liquidation/profit";
 
 dotenv.config();
 
@@ -10,10 +11,21 @@ dotenv.config();
 const AAVE_POOL_ABI = [
     "function getUserAccountData(address user) view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)",
     "function getReservesList() view returns (address[])",
-    "function getReserveData(address asset) view returns (tuple(uint256 unbacked, uint256 accruedToTreasuryScaled, uint256 totalAToken, uint256 totalStableDebt, uint256 totalVariableDebt, uint256 liquidityRate, uint256 variableBorrowRate, uint256 stableBorrowRate, uint256 averageStableBorrowRate, uint256 liquidityIndex, uint256 variableBorrowIndex, uint40 lastUpdateTimestamp) data)",
+    "function getReserveData(address asset) view returns (tuple(uint256 unbacked, uint256 accruedToTreasuryScaled, uint256 totalAToken, uint256 totalStableDebt, uint256 totalVariableDebt, uint256 liquidityRate, uint256 variableBorrowRate, uint256 stableBorrowRate, uint256 averageStableBorrowRate, uint256 liquidityIndex, uint256 variableBorrowIndex, uint40 lastUpdateTimestamp, address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress, address interestRateStrategyAddress, uint8 id) )",
     "function getConfiguration(address asset) view returns (tuple(uint256 data) config)",
-    "function getUserConfiguration(address user) view returns (tuple(uint256 data) config)"
+    "function getUserConfiguration(address user) view returns (tuple(uint256 data) config)",
+    "function getUserReserveData(address asset, address user) view returns (uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled)",
+    "function liquidationCall(address collateralAsset, address debtAsset, address user, uint256 debtToCover, bool receiveAToken) external",
+    "function getAssetsPrices(address[] assets) external view returns (uint256[])",
 ];
+
+const AAVE_DATA_PROVIDER_ABI = [
+  "function getReserveTokensAddresses(address asset) view returns (address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress)",
+  "function getUserReserveData(address asset, address user) view returns (uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled)",
+  "function getReserveConfigurationData(address asset) view returns (uint256 decimals, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus, uint256 reserveFactor, bool usageAsCollateralEnabled, bool borrowingEnabled, bool stableBorrowRateEnabled, bool isActive, bool isFrozen)"
+];
+
+const ERC20_ABI = ["function balanceOf(address) view returns (uint256)"];
 
 // Interface for reserve configuration
 interface ReserveConfig {
@@ -31,12 +43,19 @@ interface ReserveConfig {
 
 interface Position {
     user: string;
-    healthFactor: number;
+    healthFactor: bigint;
     totalCollateralETH: number;
     totalDebtETH: number;
     estimatedProfit: number;
     collateralAsset?: string;
     liquidationBonus?: number;
+}
+
+interface Opportunity {
+    debtAsset: string;
+    collateralAsset: string;
+    repayAmount: bigint;
+    estimatedProfitUsd?: number;
 }
 
 type SubgraphPosition = {
@@ -60,11 +79,14 @@ const MULTICALL3_ABI = [
 ];
 
 const ADDRESSES_PROVIDER_ABI = [
-  "function getPriceOracle() external view returns (address)"
+  "function getPriceOracle() external view returns (address)",
+  "function getPoolDataProvider() external view returns (address)",
+  "function getPool() external view returns (address)",
 ];
 
 const AAVE_ORACLE_ABI = [
   "function getAssetPrice(address asset) external view returns (uint256)",
+  "function getAssetsPrices(address[] assets) external view returns (uint256[] memory)",
   "function BASE_CURRENCY_UNIT() external view returns (uint256)"
 ];
 
@@ -73,16 +95,16 @@ const DATABASE_URL = `postgres://${process.env.DB_USER}:${process.env.DB_PASSWOR
 export class PositionMonitor {
     private provider: ethers.AbstractProvider;
     private pool: ethers.Contract;
-    private minHealthFactor: number;
-    private minHealthFactorThreshold: number;
+    private minHealthFactor: bigint;
+    private minHealthFactorThreshold: bigint;
     private minProfitUSD: number;
-    private addressesCache: Set<string>;
-    private lastUpdate: number;
     private reservesList: string[] | null;
     private oracle: ethers.Contract | null = null;
-    private highFrequencyHealthFactorCheck: number;
+    private highFrequencyHealthFactorCheck: bigint;
     private multicall: ethers.Contract;
     private db: Pool;
+    private dataProvider: ethers.Contract;
+    private ap: ethers.Contract;
 
     constructor() {
         const rpcProvider = new RpcProvider();
@@ -92,20 +114,33 @@ export class PositionMonitor {
             AAVE_POOL_ABI,
             this.provider
         );
-        this.minHealthFactor = parseFloat(process.env.MIN_HEALTH_FACTOR || '1');
-        this.minHealthFactorThreshold = parseFloat(process.env.MIN_HEALTH_FACTOR_THRESHOLD || '1.05');
+        this.minHealthFactor = 1_000_000_000_000_000_000n;
+        this.highFrequencyHealthFactorCheck = 1_010_000_000_000_000_000n;
+        this.minHealthFactorThreshold = 1_050_000_000_000_000_000n;
         this.minProfitUSD = parseFloat(process.env.MIN_PROFIT_USD || '100');
-        this.addressesCache = new Set<string>();
-        this.lastUpdate = 0;
         this.reservesList = null;
-        this.highFrequencyHealthFactorCheck = parseFloat(
-            process.env.HIGH_FREQUENCY_HEALTH_FACTOR_CHECK || '1.01'
-        );
         this.multicall = new ethers.Contract(MULTICALL3_ADDR, MULTICALL3_ABI, this.provider);
         this.db = new Pool({ connectionString: DATABASE_URL });
+
+        const dp = process.env.AAVE_PROTOCOL_DATA_PROVIDER;
+        if (!dp) throw new Error("Missing AAVE_PROTOCOL_DATA_PROVIDER");
+
+        this.dataProvider = new ethers.Contract(dp, AAVE_DATA_PROVIDER_ABI, this.provider);
+
+        this.ap = new ethers.Contract(
+          "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
+          ADDRESSES_PROVIDER_ABI,
+          this.provider
+        );
+        this.log();
     }
 
-    private async saveNormalWatchlistPlaceholder(args: { user: string; healthFactor: number }) {
+    private async log() {
+        console.log("Pool =", await this.ap.getPool());
+        console.log("PoolDataProvider =", await this.ap.getPoolDataProvider());
+    }
+
+    private async saveNormalWatchlistPlaceholder(args: { user: string; healthFactor: bigint }) {
         console.log(`📝 [normal-watchlist] user=${args.user} hf=${args.healthFactor}`);
 
         const chainId = parseInt(process.env.CHAIN_ID ?? "42161", 10);
@@ -148,7 +183,7 @@ export class PositionMonitor {
         );
     }
 
-    private async saveHighFreqWatchlistPlaceholder(args: { user: string; healthFactor: number }) {
+    private async saveHighFreqWatchlistPlaceholder(args: { user: string; healthFactor: bigint }) {
         const chainId = parseInt(process.env.CHAIN_ID ?? "42161", 10);
         const user = args.user.toLowerCase();
 
@@ -187,6 +222,11 @@ export class PositionMonitor {
         );
 
         console.log(`⚡ [highfreq-watchlist] user=${user} hf=${args.healthFactor}`);
+    }
+
+    private async getATokenAddress(asset: string): Promise<string> {
+        const [aTokenAddress] = await this.dataProvider.getReserveTokensAddresses(asset);
+        return aTokenAddress;
     }
 
     private async getAaveOracle(): Promise<ethers.Contract> {
@@ -293,6 +333,153 @@ export class PositionMonitor {
         return null;
     }
 
+    private async getUserCollaterals(user: string): Promise<string[]> {
+        const config = await this.pool.getUserConfiguration(user);
+        const reserves = await this.pool.getReservesList();
+
+        const collaterals: string[] = [];
+
+        for (let i = 0; i < reserves.length; i++) {
+            const isCollateral = (config.data >> BigInt(i * 2)) & 1n;
+            if (isCollateral === 1n) {
+                const aTokenAddress = await this.getATokenAddress(reserves[i]);
+                const aToken = new ethers.Contract(aTokenAddress, ERC20_ABI, this.provider);
+                const bal: bigint = await aToken.balanceOf(user);
+
+                if (bal > 0n) {
+                    collaterals.push(reserves[i]);
+                }
+            }
+        }
+
+        return collaterals;
+    }
+
+    private async getUserDebts(user: string): Promise<{
+        asset: string;
+        stableDebt: bigint;
+        variableDebt: bigint;
+    }[]> {
+        const reserves = await this.pool.getReservesList();
+        const debts = [];
+
+        for (const asset of reserves) {
+            const reserveData = await this.dataProvider.getUserReserveData(asset, user);
+
+            if (reserveData.currentStableDebt > 0n || reserveData.currentVariableDebt > 0n) {
+            debts.push({
+                asset,
+                stableDebt: reserveData.currentStableDebt,
+                variableDebt: reserveData.currentVariableDebt
+            });
+            }
+        }
+
+        return debts;
+    }
+
+    private async getLiquidationParams(asset: string) {
+        const cfg = await this.dataProvider.getReserveConfigurationData(asset);
+
+        // cfg.liquidationBonus is typically like 10500 (i.e. 5% bonus) depending on market/config
+        const liquidationBonusBps = BigInt(cfg.liquidationBonus);
+        const liquidationThresholdBps = BigInt(cfg.liquidationThreshold);
+
+        // close factor: see note below
+        const closeFactorBps = 5000n; // conservative default (50%)
+
+        return { liquidationBonus: liquidationBonusBps, liquidationThreshold: liquidationThresholdBps, closeFactor: closeFactorBps };
+    }
+
+    private async getAssetDecimalsMap(assetAddresses: string[]): Promise<Map<string, number>> {
+        const chainId = parseInt(process.env.CHAIN_ID ?? "42161", 10);
+        const unique = Array.from(new Set(assetAddresses.map(a => a.toLowerCase())));
+
+        const res = await this.db.query<{ asset_address: string; decimals: number }>(
+            `
+            SELECT asset_address, decimals
+            FROM assets
+            WHERE chain_id = $1
+            AND asset_address = ANY($2::citext[])
+            `,
+            [chainId, unique]
+        );
+
+        const m = new Map<string, number>();
+        for (const row of res.rows) {
+            if (row.decimals == null) continue;
+            m.set(row.asset_address.toLowerCase(), Number(row.decimals));
+        }
+        return m;
+    }
+
+
+    private async evaluateLiquidation(user: string): Promise<Opportunity[]> {
+        const oracle = await this.getAaveOracle();
+
+        const collaterals = await this.getUserCollaterals(user);
+        const debts = await this.getUserDebts(user);
+
+        const assets = [...collaterals, ...debts.map(d => d.asset)];
+        const decimalsByAsset = await this.getAssetDecimalsMap(assets);
+        const pricesArray = await oracle.getAssetsPrices(assets) as bigint[];
+
+        const priceByAsset = new Map<string, bigint>();
+        assets.forEach((a, i) => priceByAsset.set(a.toLowerCase(), pricesArray[i]));
+
+        const baseUnit = await oracle.BASE_CURRENCY_UNIT() as bigint; // for profit calc if/when needed
+
+        const opportunities: Opportunity[] = [];
+
+        for (const debt of debts) {
+            const debtAmount = debt.variableDebt;
+            if (debtAmount === 0n) continue;
+
+            for (const col of collaterals) {
+                const colAddress = await this.getATokenAddress(col);
+                const colToken = new ethers.Contract(colAddress, ERC20_ABI, this.provider);
+                const colBalance = await colToken.balanceOf(user);
+                if (colBalance === 0n) continue;
+
+                const { liquidationBonus, closeFactor } = await this.getLiquidationParams(col);
+
+                const priceDebt = priceByAsset.get(debt.asset.toLowerCase());
+                const priceCol  = priceByAsset.get(col.toLowerCase());
+                if (!priceDebt || !priceCol) continue;
+
+                const debtDecimals = decimalsByAsset.get(debt.asset.toLowerCase());
+                const colDecimals  = decimalsByAsset.get(col.toLowerCase());
+                if (debtDecimals == null || colDecimals == null) continue;
+
+                const { repayAmount, profitUsdApprox } = evaluateProfit({
+                    debtAmount,
+                    collateralBalance: colBalance,
+                    priceDebt,
+                    priceCol,
+                    baseUnit,
+                    closeFactorBps: closeFactor,
+                    liquidationBonusBps: liquidationBonus,
+                    dexFeeBps: 30n,
+                    debtDecimals,
+                    colDecimals,
+                });
+
+                if (profitUsdApprox < this.minProfitUSD) continue;
+
+                if (repayAmount > 0n) {
+                    opportunities.push({
+                        debtAsset: debt.asset,
+                        collateralAsset: col,
+                        repayAmount,
+                        estimatedProfitUsd: profitUsdApprox
+                    });
+                }
+            }
+        }
+
+        return opportunities;
+    }
+
     private async getReserveConfig(asset: string): Promise<ReserveConfig> {
         const { data } = await this.pool.getConfiguration(asset);
         const config = BigInt(data.toString());
@@ -356,7 +543,7 @@ export class PositionMonitor {
                     const accountData = batchData[j];
                     if (!accountData) continue;
 
-                    const hf = parseFloat(ethers.formatUnits(accountData.healthFactor, 18));
+                    const hf = accountData.healthFactor;
 
                     // 1) Above threshold: > 1.05
                     if (hf >= this.minHealthFactorThreshold) { 
@@ -377,32 +564,23 @@ export class PositionMonitor {
                     }
 
                     // 4) Liquidatable candidates: hf < MIN_HEALTH_FACTOR -> do profitability checks
-                    const totalCollateralETH = parseFloat(ethers.formatUnits(accountData.totalCollateralBase, 18));
-                    const totalDebtETH = parseFloat(ethers.formatUnits(accountData.totalDebtBase, 18));
+                    const opportunities: Opportunity[] = await this.evaluateLiquidation(user);
 
-                    const collateralAsset = await this.getUserCollateral(user);
-                    if (!collateralAsset) continue;
+                    if (opportunities.length === 0) {
+                        // Correct behavior: liquidatable but nothing seizable
+                        continue;
+                    }
 
-                    const reserveConfig = await this.getReserveConfig(collateralAsset);
-                    const liquidationBonus = reserveConfig.liquidationBonus / 100;
-
-                    const maxLiquidation = totalDebtETH * 0.5;
-                    const estimatedProfit = (maxLiquidation * liquidationBonus) - (maxLiquidation * 0.001);
-
-                    const collateralPriceUSD = await this.getAssetPriceUSD(collateralAsset);
-                    const estimatedProfitUSD = estimatedProfit * collateralPriceUSD;
-
-                    if (estimatedProfitUSD < this.minProfitUSD) continue;
-
-                    positions.push({
-                        user,
-                        healthFactor: hf,
-                        totalCollateralETH,
-                        totalDebtETH,
-                        estimatedProfit: estimatedProfitUSD,
-                        collateralAsset,
-                        liquidationBonus: liquidationBonus * 100
-                    });
+                    for (const opp of opportunities) {
+                        positions.push({
+                            user,
+                            healthFactor: accountData.healthFactor,
+                            totalCollateralETH: Number(accountData.totalCollateralBase),
+                            totalDebtETH: Number(accountData.totalDebtBase),
+                            estimatedProfit: Number(opp.estimatedProfitUsd),
+                            collateralAsset: opp.collateralAsset
+                        });
+                    }
 
                     checked++;
                     if (checked % 100 === 0) {

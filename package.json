@@ -13,7 +13,8 @@
     "monitor": "ts-node scripts/monitor.ts",
     "monitor:continuous": "ts-node src/index.ts",
     "monitor:highfreq": "ts-node scripts/monitor_highfreq.ts",
-    "monitor:normal": "ts-node scripts/monitor_normal.ts"
+    "monitor:normal": "ts-node scripts/monitor_normal.ts",
+    "sync:aave-assets": "ts-node scripts/sync_aave_assets.ts"
   },
   "keywords": [
     "aave",

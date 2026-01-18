@@ -13,6 +13,18 @@ function is429(err: any): boolean {
   return false;
 }
 
+function is500(err: any): boolean {
+  const status = String(err?.info?.responseStatus || "");
+  if (status.includes("500")) return true;
+
+  if (err?.info?.error?.code === 500) return true;
+
+  const body = String(err?.info?.responseBody || "");
+  if (body.includes("\"code\":500")) return true;
+
+  return false;
+}
+
 export type RotatingOptions = {
   chainId: number;              // required
   slotIntervalMs?: number;      // throttle per backend
@@ -93,6 +105,13 @@ export class RotatingRpcProvider extends ethers.AbstractProvider {
         if (is429(e)) {
           console.log(
             `[rotate] 429 on #${idx} (${this.urls[idx]}) op=${req?.method ?? req?.action ?? "unknown"}; trying next`
+          );
+          continue;
+        }
+
+        if (is500(e)) {
+          console.log(
+            `[rotate] 500 on #${idx} (${this.urls[idx]}) op=${req?.method ?? req?.action ?? "unknown"}; trying next`
           );
           continue;
         }
