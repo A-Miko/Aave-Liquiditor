@@ -51,14 +51,10 @@ export function evaluateProfit(args: ProfitInputs): ProfitResult {
     colDecimals,
   });
 
-  // repayValueBase = repayAmount * priceDebt / baseUnit
   const repayValueBase = (repayAmount * priceDebt) / pow10(debtDecimals);
 
-  // seizedCollateral = repayAmount * liquidationBonusBps / 10_000
-  const seizedCollateral = (repayAmount * liquidationBonusBps) / 10_000n;
-
-  // seizedValueBase = seizedCollateral * priceCol / baseUnit
-  const seizedValueBase = (seizedCollateral * priceCol) / pow10(colDecimals);
+  // Apply liquidation bonus on VALUE
+  const seizedValueBase = (repayValueBase * liquidationBonusBps) / 10_000n;
 
   // Fee on the repaid leg (simple model; adjust if you prefer fee on seized leg)
   const feeBase = (repayValueBase * dexFeeBps) / 10_000n;

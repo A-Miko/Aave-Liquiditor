@@ -548,18 +548,33 @@ export class PositionMonitor {
                     // 1) Above threshold: > 1.05
                     if (hf >= this.minHealthFactorThreshold) { 
                         // ignore
+                        checked++;
+                        if (checked % 100 === 0) {
+                            console.log(`✓ Analyzed ${checked}/${addresses.length} addresses`);
+                        }
+
                         continue;
                     } 
                     // 2) Between 1.05 and 1.01
                     else if (hf <= this.minHealthFactorThreshold && hf >= this.highFrequencyHealthFactorCheck) {
                         // normal watchlist: [HIGH_FREQUENCY, MIN_HEALTH_FACTOR_THRESHOLD) 
                         await this.saveNormalWatchlistPlaceholder({ user, healthFactor: hf });
+                        checked++;
+                        if (checked % 100 === 0) {
+                            console.log(`✓ Analyzed ${checked}/${addresses.length} addresses`);
+                        }
+
                         continue;
                     } 
                     // 3) Between 1.01 and 1.00
                     else if (hf <= this.highFrequencyHealthFactorCheck && hf >= this.minHealthFactor) {
                         // 1.005 - high-frequency: [MIN_HEALTH_FACTOR, HIGH_FREQUENCY)
                         await this.saveHighFreqWatchlistPlaceholder({ user, healthFactor: hf });
+                        checked++;
+                        if (checked % 100 === 0) {
+                            console.log(`✓ Analyzed ${checked}/${addresses.length} addresses`);
+                        }
+
                         continue;
                     }
 
@@ -568,6 +583,11 @@ export class PositionMonitor {
 
                     if (opportunities.length === 0) {
                         // Correct behavior: liquidatable but nothing seizable
+                        checked++;
+                        if (checked % 100 === 0) {
+                            console.log(`✓ Analyzed ${checked}/${addresses.length} addresses`);
+                        }
+
                         continue;
                     }
 

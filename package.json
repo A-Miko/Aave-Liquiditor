@@ -1,6 +1,6 @@
 {
   "name": "aave-liquidator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bot liquidador automatizado para Aave v3 en Arbitrum",
   "main": "dist/index.js",
   "scripts": {
